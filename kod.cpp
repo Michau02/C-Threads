@@ -17,13 +17,17 @@ using namespace std;
 using namespace this_thread;
 
 static bool shouldCloseWindow = false;
+static bool shouldTerminate = false;
 vector<int> stanowiska = {0,0,0};
+vector<mutex> stanowiska_mtx(3);
+vector<condition_variable> stanowiska_cv(3);
+
 mutex mtx_new_winda;
 condition_variable cv_new_winda;
 
 std::condition_variable cv;
 mutex mtx_stanowiska;
-bool ready_specific = false; // Dodatkowa zmienna kontrolna
+bool ready_specific = false;
 int specific_floor;
 
 class Klient;
@@ -32,12 +36,10 @@ class Winda {
 private:
     int size, dest, stopTime = 4, speed = 2;
     bool active, stoppedAlready, notified = false;
-    // NOWE -> ETAP 2
     int maxCapacity = 3;
     int currentOccupancy = 0;
     mutex mtx;
 
-    // żeby sie nie kopiowało bo klasa mutex jest niekopiowalna
     Winda(const Winda&) = delete;
     Winda& operator=(const Winda&) = delete;
 
@@ -51,7 +53,7 @@ public:
         size = 100;
         active = true;
         canSpawnNext = false;
-        dest = rand() % 3 + 1; // piętro 1/2/3
+        dest = rand() % 3 + 1;
         stoppedAlready = false;
     }
 
@@ -69,8 +71,6 @@ public:
         }
     }
 
-
-
     int getY() const { return y; }
     int getDest() const { return dest; }
     int getSpeed() const { return speed; }
@@ -80,7 +80,6 @@ public:
         return mtx;
     }
 
-    // NOWE -> ETAP 2
     bool isFull() const { return currentOccupancy >= maxCapacity; }
 
     void addClient() {
@@ -96,7 +95,6 @@ public:
             currentOccupancy--;
         }
     }
-
 
     void draw() const {
         glColor3f(0.0, 1.0, 0.0);
@@ -119,18 +117,16 @@ public:
 
 class Klient {
 private:
-    int last_y, x, y, size, fig, speed, workSpace, workTime, /*// NOWE -> ETAP 2*/floor = 0;
+    int last_y, x, y, size, fig, speed, workSpace, workTime, floor = 0;
     float r, g, b;
     static list<shared_ptr<Winda>>* windy_ptr;
     bool active;
     shared_ptr<Winda> currentElevator = nullptr;
     bool hasntStoppedYet = true;
     bool inElevator = false;
-    // NOWE -> ETAP 2
     bool canWork = true;
     bool hasWorkedAlready = false;
 
-    //  eby sie nie kopiowało bo klasa mutex jest niekopiowalna
     Klient(const Klient&) = delete;
     Klient& operator=(const Klient&) = delete;
 
@@ -139,7 +135,7 @@ public:
         x = 0;
         y = 5;
         size = rand() % 20 + 50;
-        fig = rand() % 5 + 1; // 1-5 kwadrat, koło (no koło nie bo trzebaby fora a mozna prosciej inne figury), trapez, itd
+        fig = rand() % 5 + 1;
         speed = 1 + 2*(rand() % 3);
         r = static_cast<float>(rand()) / RAND_MAX;
         g = static_cast<float>(rand()) / RAND_MAX;
@@ -155,12 +151,14 @@ public:
 
     void move() {
         while (active) {
+            if (shouldTerminate) {
+                break;
+            }
             sleep_for(chrono::milliseconds(10));
             last_y = y;
             if (x < 365) {
                 x += speed;
-            }
-            else if (x > 360 && x < 400) {
+            } else if (x > 360 && x < 400) {
                 if (!inElevator && currentElevator == nullptr && !shouldCloseWindow) {
                     unique_lock<mutex> lock(mtx_new_winda);
                     cv_new_winda.wait(lock);
@@ -188,51 +186,43 @@ public:
                     currentElevator->removeClient();
                     inElevator = false;
                 }
-                
-                
-                // NOWE -> ETAP 2
-                if(x <= workSpace && x >= 500 && !hasWorkedAlready){
-                    if(stanowiska[floor] == 1){
-                        std::unique_lock<std::mutex> lock(mtx_stanowiska);
-                        std::cout << "Klient is waiting..." << std::endl;
-                        cv.wait(lock, [this] { return ready_specific; }); // Czekaj, aż ready_specific będzie true lub floor będzie równe specific_floor
-                        if (ready_specific && this->floor == specific_floor) { // Jeśli ready_specific jest true i floor jest równe specific_floor
-                            std::cout << "Klient is awake!" << std::endl;
-                            ready_specific = false; // Resetowanie ready_specific
-                        } 
-                        canWork = false;
-                    }
-                    else if(stanowiska[floor] < 1){
+
+                if (x <= workSpace && x >= 500 && !hasWorkedAlready) {
+                    if (stanowiska[floor] == 1) {
+                        std::unique_lock<std::mutex> lock(stanowiska_mtx[floor]);
+                        std::cout << "Klient " << this << " czeka... " << floor << std::endl;
+                        stanowiska_cv[floor].wait(lock, [this, floor_copy = floor] { return shouldTerminate || stanowiska[floor_copy] == 0; });
+                        if (shouldTerminate) break;
+                        std::cout << "Klient " << this << " zostal wybudzony..." << " " << floor << std::endl;
                         canWork = true;
-                        mtx_stanowiska.lock();
+                    } else if (stanowiska[floor] < 1) {
+                        canWork = true;
+                        std::lock_guard<std::mutex> lock(stanowiska_mtx[floor]);
                         stanowiska[floor] += 1;
-                        mtx_stanowiska.unlock();
                         hasWorkedAlready = true;
                     }
                 }
-                if(!canWork){x += 0;}
-                else x += speed;
+                if (!canWork) {
+                    x += 0;
+                } else {
+                    x += speed;
+                }
             }
-            // NOWE -> ETAP 2
+
             if (x > workSpace && hasntStoppedYet) {
                 sleep_for(chrono::seconds(workTime));
-                wake_specific_client(floor);
-                hasntStoppedYet = false;
-                mtx_stanowiska.lock();
+                stanowiska_mtx[floor].lock();
                 stanowiska[floor] -= 1;
-                mtx_stanowiska.unlock();
+                stanowiska_mtx[floor].unlock();
+                stanowiska_cv[floor].notify_one();
+                hasntStoppedYet = false;
             }
             if (x > 800) {
                 deactivate();
             }
         }
     }
-    void wake_specific_client(int floor) {
-        std::lock_guard<std::mutex> lock(mtx_stanowiska);
-        specific_floor = floor;
-        ready_specific = true;
-        cv.notify_one();
-    }
+
     mutex& getElevatorMutex() {
         if (currentElevator != nullptr) {
             return currentElevator->getMutex();
@@ -241,32 +231,32 @@ public:
     }
 
     void draw(int i) const {
-        glColor3f(r, g, b); // Ustawienie koloru na podstawie wartości red, green i blue kwadratu
+        glColor3f(r, g, b);
         switch (fig) {
             case 1:
-                glBegin(GL_QUADS); //kwadrat
-                glVertex2i(x, y);                // Lewy górny róg
-                glVertex2i(x + size, y);         // Prawy górny róg
-                glVertex2i(x + size, y + size);  // Prawy dolny róg
-                glVertex2i(x, y + size);         // Lewy dolny róg
+                glBegin(GL_QUADS);
+                glVertex2i(x, y);
+                glVertex2i(x + size, y);
+                glVertex2i(x + size, y + size);
+                glVertex2i(x, y + size);
                 glEnd();
                 break;
             case 2:
-                glBegin(GL_TRIANGLES); //trójkąt
-                glVertex2i(x, y);                // Lewy górny róg
-                glVertex2i(x + size, y + size);  // Prawy dolny róg
-                glVertex2i(x, y + size);         // Lewy dolny róg
+                glBegin(GL_TRIANGLES);
+                glVertex2i(x, y);
+                glVertex2i(x + size, y + size);
+                glVertex2i(x, y + size);
                 glEnd();
                 break;
             case 3:
-                glBegin(GL_TRIANGLES);//trójkąt
-                glVertex2i(x + size, y);         // Prawy górny róg
-                glVertex2i(x + size, y + size);  // Prawy dolny róg
-                glVertex2i(x, y + size);         // Lewy dolny róg
+                glBegin(GL_TRIANGLES);
+                glVertex2i(x + size, y);
+                glVertex2i(x + size, y + size);
+                glVertex2i(x, y + size);
                 glEnd();
                 break;
             case 4:
-                glBegin(GL_POLYGON); //trapez
+                glBegin(GL_POLYGON);
                 glVertex2i(x, y);
                 glVertex2i(x + size * 0.8, y);
                 glVertex2i(x + size, y + size);
@@ -274,11 +264,12 @@ public:
                 glEnd();
                 break;
             case 5:
-                glBegin(GL_POLYGON); //romb
+                glBegin(GL_POLYGON);
                 glVertex2i(x + size * 0.5, y);
-                glVertex2i(x + size, y + size * 0.5);
-                glVertex2i(x + size * 0.5, y + size);
-                glVertex2i(x, y + size * 0.5);
+                glVertex2i(x + size, y + size * 0.3);
+                glVertex2i(x + size * 0.8, y + size);
+                glVertex2i(x + size * 0.2, y + size);
+                glVertex2i(x, y + size * 0.3);
                 glEnd();
                 break;
         }
@@ -303,7 +294,7 @@ void create_threads(list<shared_ptr<Klient>>& klienci, list<thread>& c_threads) 
         auto klient = make_shared<Klient>();
         klienci.push_back(klient);
         c_threads.push_back(thread(&Klient::move, klient));
-        sleep_for(chrono::seconds(rand()%3+1));
+        sleep_for(chrono::seconds(rand()%4+1));
     }
 }
 
@@ -440,6 +431,12 @@ int main() {
         // Obsługa zdarzeń okna
         glfwPollEvents();
     }
+
+    shouldTerminate = true;
+    for (auto& cv : stanowiska_cv) {
+        cv.notify_all();
+    }
+    cv_new_winda.notify_all();
 
     for (auto& k : klienci) {
         k->deactivate();
