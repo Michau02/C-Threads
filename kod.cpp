@@ -195,7 +195,7 @@ public:
                     if(stanowiska[floor] == 1){
                         std::unique_lock<std::mutex> lock(mtx_stanowiska);
                         std::cout << "Klient is waiting..." << std::endl;
-                        cv.wait(lock, [this] { return ready_specific || this->floor == specific_floor; }); // Czekaj, aż ready_specific będzie true lub floor będzie równe specific_floor
+                        cv.wait(lock, [this] { return ready_specific; }); // Czekaj, aż ready_specific będzie true lub floor będzie równe specific_floor
                         if (ready_specific && this->floor == specific_floor) { // Jeśli ready_specific jest true i floor jest równe specific_floor
                             std::cout << "Klient is awake!" << std::endl;
                             ready_specific = false; // Resetowanie ready_specific
