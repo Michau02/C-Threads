@@ -1,6 +1,7 @@
 /*ETAP 2 - zalozenia:
 - pojemnośc windy ma być ograniczona (maksymalnie 3 osoby jednocześnie), klienci czekają na następne windy
 - przy obsłudze może być w jednym momencie tylko jedna osoba. Reszta czeka przed miejscem obsługi aż zwolni się zmiejsce
+- klienci wchodzą do windy według określonej kolejności - najpierw wchodzą najwolniejsi klienci
 */
 
 #include <GLFW/glfw3.h>
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <vector>
 #include <condition_variable>
+#include <queue>
 
 using namespace std;
 using namespace this_thread;
@@ -115,11 +117,19 @@ public:
     }
 };
 
-class Klient {
+class Klient : public enable_shared_from_this<Klient>{
 private:
+
     int last_y, x, y, size, fig, speed, workSpace, workTime, floor = 0;
+    struct CompareClients {
+        bool operator()(const shared_ptr<Klient>& a, const shared_ptr<Klient>& b) {
+            return a->speed > b->speed; 
+        }
+    };
     float r, g, b;
     static list<shared_ptr<Winda>>* windy_ptr;
+    static priority_queue<shared_ptr<Klient>, vector<shared_ptr<Klient>>, CompareClients> clientQueue;
+    static mutex mtx_queue;
     bool active;
     shared_ptr<Winda> currentElevator = nullptr;
     bool hasntStoppedYet = true;
@@ -160,17 +170,29 @@ public:
                 x += speed;
             } else if (x > 360 && x < 400) {
                 if (!inElevator && currentElevator == nullptr && !shouldCloseWindow) {
+                    addClientToQueue(shared_from_this());
                     unique_lock<mutex> lock(mtx_new_winda);
-                    cv_new_winda.wait(lock);
-                    for (auto& winda : *windy_ptr) {
-                        if (!winda->isFull() && winda->getY() < 20) {
-                            currentElevator = winda;
-                            winda->addClient();
-                            inElevator = true;
-                            floor = currentElevator->getDest() - 1;
-                            break;
+                    cv_new_winda.wait(lock, [this]() {
+                        if (shouldTerminate) return true;
+                        auto nextClient = getNextClientFromQueue();
+                        if (nextClient.get() != this) {
+                            return false;
                         }
-                    }
+
+                        for (auto& winda : *windy_ptr) {
+                            if (!winda->isFull() && winda->getY() < 20) {
+                                currentElevator = winda;
+                                winda->addClient();
+                                inElevator = true;
+                                floor = currentElevator->getDest() - 1;
+                                removeClientFromQueue();
+                                if(!winda->isFull() && clientQueue.size() > 0) cv_new_winda.notify_all();
+
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
                 }
                 if (currentElevator != nullptr && inElevator) {
                     unique_lock<mutex> elevator_lock(getElevatorMutex());
@@ -190,10 +212,8 @@ public:
                 if (x <= workSpace && x >= 500 && !hasWorkedAlready) {
                     if (stanowiska[floor] == 1) {
                         std::unique_lock<std::mutex> lock(stanowiska_mtx[floor]);
-                        std::cout << "Klient " << this << " czeka... " << floor << std::endl;
                         stanowiska_cv[floor].wait(lock, [this, floor_copy = floor] { return shouldTerminate || stanowiska[floor_copy] == 0; });
                         if (shouldTerminate) break;
-                        std::cout << "Klient " << this << " zostal wybudzony..." << " " << floor << std::endl;
                         canWork = true;
                     } else if (stanowiska[floor] < 1) {
                         canWork = true;
@@ -213,8 +233,8 @@ public:
                 sleep_for(chrono::seconds(workTime));
                 stanowiska_mtx[floor].lock();
                 stanowiska[floor] -= 1;
-                stanowiska_mtx[floor].unlock();
                 stanowiska_cv[floor].notify_one();
+                stanowiska_mtx[floor].unlock();
                 hasntStoppedYet = false;
             }
             if (x > 800) {
@@ -223,12 +243,52 @@ public:
         }
     }
 
+    static void addClientToQueue(shared_ptr<Klient> client) {
+        lock_guard<mutex> lock(mtx_queue);
+        clientQueue.push(client);
+        cout << "ADDED " << client->speed << ": ";
+        client->printClientQueue(clientQueue);
+    }
+
+    static void removeClientFromQueue() {
+        lock_guard<mutex> lock(mtx_queue);
+        if (!clientQueue.empty()) {
+            shared_ptr<Klient> c = clientQueue.top();
+            clientQueue.pop();
+            cout << "REMOVED " << c->speed << ": ";
+            c->printClientQueue(clientQueue);
+        }
+    }
+
+    static shared_ptr<Klient> getNextClientFromQueue() {
+        lock_guard<mutex> lock(mtx_queue);
+        if (!clientQueue.empty()) {
+            return clientQueue.top();
+        }
+        return nullptr;
+    }
+
     mutex& getElevatorMutex() {
         if (currentElevator != nullptr) {
             return currentElevator->getMutex();
         }
         throw runtime_error("Klient nie jest przypisany do żadnej windy");
     }
+
+
+    void printClientQueue(priority_queue<shared_ptr<Klient>, vector<shared_ptr<Klient>>, CompareClients> clientsQueue) {
+        priority_queue<shared_ptr<Klient>, vector<shared_ptr<Klient>>, CompareClients> tempQueue = clientsQueue;
+
+        cout << "[ ";
+        while (!tempQueue.empty()) {
+            shared_ptr<Klient> client = tempQueue.top();
+            tempQueue.pop();
+            
+            cout << client->speed << " ";
+        }
+        cout <<"]" << endl;
+    }
+
 
     void draw(int i) const {
         glColor3f(r, g, b);
@@ -281,6 +341,8 @@ public:
 };
 
 list<shared_ptr<Winda>>* Klient::windy_ptr = nullptr;
+priority_queue<shared_ptr<Klient>, vector<shared_ptr<Klient>>, Klient::CompareClients> Klient::clientQueue;
+mutex Klient::mtx_queue;
 
 void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
     if (key == GLFW_KEY_SPACE && action == GLFW_PRESS) {
@@ -306,7 +368,7 @@ void create_winda_threads(list<shared_ptr<Winda>>& windy, list<thread>& w_thread
             w_threads.push_back(thread(&Winda::move, winda));
 
             lock_guard<mutex> lock(mtx_new_winda);
-            cv_new_winda.notify_all();
+            cv_new_winda.notify_all();            
        }
         sleep_for(chrono::milliseconds(10));
     }
